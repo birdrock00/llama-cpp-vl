@@ -214,20 +214,44 @@ jobs:
                  + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
           open('/tmp/models/test.png', 'wb').write(png)
           PY
-          resp=$(curl -sf http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-            "model": "lfm3-vl",
-            "max_tokens": 24,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": [
-              {"type": "text", "text": "Name the single dominant colour of this image in one word."},
-              {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$(base64 -w0 /tmp/models/test.png)"'"}}
-            ]}]
-          }')
-          echo "$resp"
-          answer=$(echo "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())')
-          echo "model answered: $answer" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [ -z "$answer" ]; then echo "FATAL: empty completion from the vision path" >&2; exit 1; fi
-          docker logs smoke 2>&1 | grep -iE 'proj|image' | tail -5 || true
+          ask() {  # $1 = extra JSON for the request body, e.g. chat_template_kwargs
+            curl -sf http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d "{
+              \"model\": \"lfm3-vl\", \"max_tokens\": 48, \"temperature\": 0 $1,
+              \"messages\": [{\"role\": \"user\", \"content\": [
+                {\"type\": \"text\", \"text\": \"Name the single dominant colour of this image in one word.\"},
+                {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$(base64 -w0 /tmp/models/test.png)\"}}
+              ]}]"
+          }"
+          }
+          # LFM3-VL is a thinking model: with the default template it can spend the whole
+          # max_tokens budget in reasoning_content and return content:"". That is not a broken
+          # vision path, so the check reads whichever field the model used, and separately tries
+          # enable_thinking=false - the flag a latency-sensitive caller (frigate) will want.
+          ask '' > /tmp/resp-thinking.json || true
+          ask ', "chat_template_kwargs": {"enable_thinking": false}' > /tmp/resp-nothink.json || true
+          cat /tmp/resp-thinking.json /tmp/resp-nothink.json
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          def load(p):
+              try:
+                  return json.load(open(p))
+              except Exception as e:
+                  return {"error": str(e)}
+          got = {}
+          for name, path in (("thinking", "/tmp/resp-thinking.json"), ("no-think", "/tmp/resp-nothink.json")):
+              r = load(path)
+              if "error" in r:
+                  print(f"{name}: NO RESPONSE ({r['error']})"); continue
+              msg = r["choices"][0]["message"]
+              text = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
+              t = r.get("timings", {})
+              print(f"{name}: {text!r}  prompt={t.get('prompt_n')}tok/{t.get('prompt_ms', 0):.0f}ms"
+                    f" ({t.get('prompt_per_second', 0):.1f} tok/s)"
+                    f" decode={t.get('predicted_n')}tok ({t.get('predicted_per_second', 0):.1f} tok/s)")
+              got[name] = text
+          if not any(got.values()):
+              sys.exit("FATAL: the vision path produced no text at all")
+          PY
 
       - name: Report
         run: |
