@@ -1,0 +1,18 @@
+# upstream source this image is built from (llama.cpp, not this repo's git history)
+#
+# LFM3 / LFM3-VL support is ggml-org/llama.cpp PR #31252
+# (https://github.com/ggml-org/llama.cpp/pull/31252), squash-merged into master as:
+19cce6919992fdffd92e0ac152caaf1e2b8f254e
+#
+# Why a custom build at all: as of 2026-10-28 the newest PUBLISHED llama.cpp release is
+# b11936, and `src/models/lfm3.cpp` returns 404 at both b11935 and b11936 - the daily
+# release images therefore cannot load an LFM3 GGUF yet ("unknown model arch 'lfm3'").
+# The merge landed at 2026-10-27T16:06Z, i.e. after the b11935 tag was cut.
+#
+# To move to an official release once one ships the arch (check:
+#   curl -o /dev/null -w '%{http_code}\n' \
+#     https://raw.githubusercontent.com/ggml-org/llama.cpp/b11937/src/models/lfm3.cpp
+# expecting 200), set REF to that tag; keep CPU_VARIANT=avx2 to serve the model on CPU only.
+UPSTREAM=https://github.com/ggml-org/llama.cpp.git
+REF=19cce6919992fdffd92e0ac152caaf1e2b8f254e
+CPU_VARIANT=avx2

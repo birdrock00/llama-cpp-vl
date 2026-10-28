@@ -1,0 +1,4 @@
+.git
+*.md
+!UPSTREAM_README.md
+.DS_Store

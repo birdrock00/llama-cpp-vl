@@ -1,0 +1,242 @@
+name: build-image
+
+# Builds the CPU-only llama.cpp image that can load LiquidAI LFM3 / LFM3-VL GGUFs and publishes
+# it to GHCR, one tag per CPU variant (see UPSTREAM_REF for the pinned llama.cpp commit and why
+# a custom build is needed at all).
+#
+# Runs on every change to the build inputs, daily (to catch an official release finally
+# carrying the arch), and on demand with an arbitrary upstream ref - including the PR ref
+# refs/pull/31252/head, which is what this repo existed for before that PR merged.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - UPSTREAM_REF
+      - .github/workflows/build-image.yml
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'llama.cpp ref to build (tag, full sha, or refs/pull/N/head). Empty = UPSTREAM_REF'
+        required: false
+        default: ''
+      cpu_variants:
+        description: 'Which CPU variants to build'
+        type: choice
+        options: [both, avx2, avx512]
+        default: both
+      push_image:
+        description: 'Push the resulting images to GHCR'
+        type: boolean
+        default: true
+      smoke_test:
+        description: 'After publishing, load an LFM3-VL GGUF in the image and generate a token'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/birdrock00/llama-cpp-vl
+
+jobs:
+  upstream:
+    # Decides what to build, and reports whether an official llama.cpp release has started to
+    # carry the arch - the signal to delete most of this repo and point the deployment at
+    # ghcr.io/ggml-org/llama.cpp:server-b<new> instead.
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.pin.outputs.ref }}
+      short: ${{ steps.pin.outputs.short }}
+      official: ${{ steps.official.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the llama.cpp ref to build
+        id: pin
+        run: |
+          set -euo pipefail
+          ref="$(grep -E '^REF=' UPSTREAM_REF | cut -d= -f2 | tr -d '[:space:]')"
+          if [ -n "${{ inputs.upstream_ref }}" ]; then ref="${{ inputs.upstream_ref }}"; fi
+          # Resolve a branch/PR ref to a sha so the tag name is stable and the build is pinned;
+          # a full sha is used as-is.
+          case "$ref" in
+            *HEAD*|refs/*)
+              sha=$(git ls-remote "$(grep -E '^UPSTREAM=' UPSTREAM_REF | cut -d= -f2)" "$ref" | awk '{print $1}')
+              [ -n "$sha" ] || { echo "FATAL: cannot resolve $ref" >&2; exit 1; }
+              ref="$sha" ;;
+          esac
+          echo "ref=$ref" | tee "$GITHUB_OUTPUT"
+          echo "short=${ref:0:9}" >> "$GITHUB_OUTPUT"
+          echo "building llama.cpp \`$ref\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Has an official release picked up LFM3 yet?
+        id: official
+        run: |
+          set -euo pipefail
+          tag=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest |
+                python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+                 "https://raw.githubusercontent.com/ggml-org/llama.cpp/$tag/src/models/lfm3.cpp")
+          if [ "$code" = "200" ]; then
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "### Official support found" >> "$GITHUB_STEP_SUMMARY"
+            echo "llama.cpp \`$tag\` contains \`src/models/lfm3.cpp\`. The pinned custom build can" >> "$GITHUB_STEP_SUMMARY"
+            echo "be replaced by the upstream image; see UPSTREAM_REF for the one-line change." >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice file=UPSTREAM_REF::official llama.cpp $tag now carries LFM3"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "llama.cpp \`$tag\` (latest release) still lacks \`src/models/lfm3.cpp\` (HTTP $code)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  image:
+    needs: upstream
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: avx2
+            # the portable image is the one the deployment uses unless the pinned node is known
+            # to have AVX-512; it also gets the unversioned :latest alias.
+            default_alias: 'true'
+          - variant: avx512
+            default_alias: 'false'
+    name: image (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        run: |
+          set -euo pipefail
+          v=${{ matrix.variant }}
+          s=${{ needs.upstream.outputs.short }}
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$v-$s"
+            echo "$IMAGE:$v-latest"
+            if [ "${{ matrix.default_alias }}" = "true" ]; then echo "$IMAGE:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image == true }}
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          build-args: |
+            UPSTREAM_REF=${{ needs.upstream.outputs.ref }}
+            CPU_VARIANT=${{ matrix.variant }}
+            VERSION=${{ needs.upstream.outputs.short }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=llama-cpp-vl
+            org.opencontainers.image.description=CPU-only llama.cpp with LFM3/LFM3-VL support (${{ matrix.variant }})
+            org.opencontainers.image.revision=${{ needs.upstream.outputs.ref }}
+            ai.liquid.llama_cpp_ref=${{ needs.upstream.outputs.ref }}
+          # Registry cache (mode=max keeps the compiled objects): the Actions cache blows its
+          # 10 GiB quota on a full ggml build, and ccache inside the layer is not shared between
+          # the two variants, which is fine - they are different binaries by design.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:cache-${{ matrix.variant }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:cache-${{ matrix.variant }},mode=max,image-manifest=true,oci-mediatypes=true
+
+  smoke:
+    # Proves the published image really serves an LFM3-VL checkpoint on CPU: loads the QAD Q4_0
+    # quant plus the Q8_0 vision projector, encodes a generated image, and requires a completion.
+    # This is the only step that would catch a build that links llama-server without mtmd, or an
+    # upstream refactor that lands the text arch but not the vision tower.
+    needs: [upstream, image]
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.smoke_test) || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Pull the published image
+        run: docker pull ${{ env.IMAGE }}:avx2-latest
+
+      - name: Download the smallest useful LFM3-VL artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/models
+          base=https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main
+          curl -fL --retry 5 -o /tmp/models/LFM3-VL-2B-QAD-Q4_0.gguf      $base/LFM3-VL-2B-QAD-Q4_0.gguf
+          curl -fL --retry 5 -o /tmp/models/mmproj-LFM3-VL-2B-Q8_0.gguf   $base/mmproj-LFM3-VL-2B-Q8_0.gguf
+          ls -l /tmp/models
+
+      - name: Serve it and ask about a picture
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 8080:8080 -v /tmp/models:/models:ro \
+            ${{ env.IMAGE }}:avx2-latest \
+              --model /models/LFM3-VL-2B-QAD-Q4_0.gguf \
+              --mmproj /models/mmproj-LFM3-VL-2B-Q8_0.gguf \
+              --alias lfm3-vl --host 0.0.0.0 --port 8080 \
+              --ctx-size 4096 --threads "$(nproc)" --temp 0.1 --top-p 1.0 --top-k 50 \
+              --min-p 0.0 --repeat-penalty 1.1 --no-reasoning-preserve --jinja
+          for i in $(seq 1 120); do
+            curl -sf http://127.0.0.1:8080/health && break || sleep 5
+          done
+          curl -sf http://127.0.0.1:8080/health
+          echo
+          docker logs smoke | tail -20
+          # a red square with "SMOKE" on it, no stock photo dependency
+          python3 - <<'PY'
+          import base64, struct, zlib
+          w = h = 128
+          raw = b''.join(b'\x00' + b'\xc8\x20\x20' * w for _ in range(h))
+          def chunk(t, d):
+              c = t + d
+              return struct.pack('>I', len(d)) + c + struct.pack('>I', zlib.crc32(c))
+          png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+                 + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+          open('/tmp/models/test.png', 'wb').write(png)
+          PY
+          resp=$(curl -sf http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+            "model": "lfm3-vl",
+            "max_tokens": 24,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": [
+              {"type": "text", "text": "Name the single dominant colour of this image in one word."},
+              {"type": "image_url", "image_url": {"url": "data:image/png;base64,'"$(base64 -w0 /tmp/models/test.png)"'"}}
+            ]}]
+          }')
+          echo "$resp"
+          answer=$(echo "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())')
+          echo "model answered: $answer" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -z "$answer" ]; then echo "FATAL: empty completion from the vision path" >&2; exit 1; fi
+          docker logs smoke 2>&1 | grep -iE 'proj|image' | tail -5 || true
+
+      - name: Report
+        run: |
+          {
+            echo "### Published"
+            echo '```'
+            echo "$IMAGE:avx2-${{ needs.upstream.outputs.short }}"
+            echo "$IMAGE:avx512-${{ needs.upstream.outputs.short }}"
+            echo "$IMAGE:latest  (= avx2-latest)"
+            echo '```'
+            echo "llama.cpp source commit: \`${{ needs.upstream.outputs.ref }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
