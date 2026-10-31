@@ -220,8 +220,7 @@ jobs:
               \"messages\": [{\"role\": \"user\", \"content\": [
                 {\"type\": \"text\", \"text\": \"Name the single dominant colour of this image in one word.\"},
                 {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,$(base64 -w0 /tmp/models/test.png)\"}}
-              ]}]"
-          }"
+              ]}]}"
           }
           # LFM3-VL is a thinking model: with the default template it can spend the whole
           # max_tokens budget in reasoning_content and return content:"". That is not a broken
